@@ -34,6 +34,8 @@ from src.utils.constants import (
     ID,
     INPUT_TOKENS,
     INTERESTS,
+    MISTRAL,
+    MISTRAL_MODEL_NAME,
     JOB_APPLICATION_PROFILE,
     JOB_DESCRIPTION,
     LANGUAGES,
@@ -181,30 +183,71 @@ class HuggingFaceModel(AIModel):
         return response
 
 
-class AIAdapter:
-    def __init__(self, config: dict, api_key: str):
-        self.model = self._create_model(config, api_key)
+class MistralModel(AIModel):
+    def __init__(self, api_key: str, llm_model: str):
+        from mistralai.client import MistralClient
+        from mistralai.models.chat_completion import ChatMessage
 
-    def _create_model(self, config: dict, api_key: str) -> AIModel:
+        self.client = MistralClient(api_key=api_key)
+        self.llm_model = llm_model
+        self.ChatMessage = ChatMessage  # Store ChatMessage for use in invoke
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        logger.debug(f"Invoking Mistral API with model: {self.llm_model}")
+        chat_message = self.ChatMessage(role="user", content=prompt)
+        try:
+            response = self.client.chat(model=self.llm_model, messages=[chat_message])
+            ai_message_content = response.choices[0].message.content
+            # Constructing AIMessage with necessary arguments
+            # Ensure id is a string; you might need a way to generate unique IDs
+            # For now, using a placeholder or a fixed ID if not critical for logging/tracking
+            return AIMessage(
+                content=ai_message_content,
+                response_metadata={ # Basic metadata, adapt as needed
+                    MODEL_NAME: self.llm_model,
+                    # Potentially add other metadata if available and relevant
+                },
+                id=f"mistral-{time.time()}" # Example ID
+            )
+        except Exception as e:
+            logger.error(f"Mistral API call failed: {e}")
+            # Return a generic error message or re-raise, depending on desired error handling
+            return AIMessage(content=f"Error invoking Mistral API: {e}", id=f"error-mistral-{time.time()}")
+
+
+class AIAdapter:
+    def __init__(self, config: dict):
+        self.model = self._create_model(config)
+
+    def _create_model(self, config: dict) -> AIModel:
         llm_model_type = cfg.LLM_MODEL_TYPE
         llm_model = cfg.LLM_MODEL
-
         llm_api_url = cfg.LLM_API_URL
+        api_key = None
 
         logger.debug(f"Using {llm_model_type} with {llm_model}")
 
         if llm_model_type == OPENAI:
+            api_key = os.getenv("OPENAI_API_KEY")
             return OpenAIModel(api_key, llm_model)
         elif llm_model_type == CLAUDE:
+            api_key = os.getenv("CLAUDE_API_KEY")
             return ClaudeModel(api_key, llm_model)
         elif llm_model_type == OLLAMA:
+            # OllamaModel does not require an API key
             return OllamaModel(llm_model, llm_api_url)
         elif llm_model_type == GEMINI:
+            api_key = os.getenv("GEMINI_API_KEY")
             return GeminiModel(api_key, llm_model)
         elif llm_model_type == HUGGINGFACE:
+            api_key = os.getenv("HUGGINGFACE_API_KEY")
             return HuggingFaceModel(api_key, llm_model)
         elif llm_model_type == PERPLEXITY:
+            api_key = os.getenv("PERPLEXITY_API_KEY")
             return PerplexityModel(api_key, llm_model)
+        elif llm_model_type == MISTRAL:
+            api_key = os.getenv("MISTRAL_API_KEY")
+            return MistralModel(api_key, llm_model)
         else:
             raise ValueError(f"Unsupported model type: {llm_model_type}")
 
@@ -213,7 +256,7 @@ class AIAdapter:
 
 
 class LLMLogger:
-    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel]):
+    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel, MistralModel]):
         self.llm = llm
         logger.debug(f"LLMLogger successfully initialized with LLM: {llm}")
 
@@ -325,7 +368,7 @@ class LLMLogger:
 
 
 class LoggerChatModel:
-    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel]):
+    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel, MistralModel]):
         self.llm = llm
         logger.debug(f"LoggerChatModel successfully initialized with LLM: {llm}")
 
@@ -388,62 +431,61 @@ class LoggerChatModel:
         logger.debug(f"Parsing LLM result: {llmresult}")
 
         try:
-            if hasattr(llmresult, USAGE_METADATA):
-                content = llmresult.content
-                response_metadata = llmresult.response_metadata
-                id_ = llmresult.id
-                usage_metadata = llmresult.usage_metadata
+            # Handle cases where AIMessage might be constructed differently by MistralModel
+            # For MistralModel, response_metadata might be directly populated
+            # and usage_metadata might not be available from the Mistral client directly in the same way
+            content = llmresult.content
+            response_metadata = llmresult.response_metadata or {} # Ensure it's a dict
+            id_ = llmresult.id
+            usage_metadata = getattr(llmresult, USAGE_METADATA, None) # Safely access usage_metadata
 
+            if usage_metadata: # If usage_metadata is available (e.g., from non-Mistral models)
                 parsed_result = {
                     CONTENT: content,
                     RESPONSE_METADATA: {
-                        MODEL_NAME: response_metadata.get(
-                            MODEL_NAME, ""
-                        ),
-                        SYSTEM_FINGERPRINT: response_metadata.get(
-                            SYSTEM_FINGERPRINT, ""
-                        ),
-                        FINISH_REASON: response_metadata.get(
-                            FINISH_REASON, ""
-                        ),
-                        LOGPROBS: response_metadata.get(
-                            LOGPROBS, None
-                        ),
+                        MODEL_NAME: response_metadata.get(MODEL_NAME, ""),
+                        SYSTEM_FINGERPRINT: response_metadata.get(SYSTEM_FINGERPRINT, ""),
+                        FINISH_REASON: response_metadata.get(FINISH_REASON, ""),
+                        LOGPROBS: response_metadata.get(LOGPROBS, None),
                     },
                     ID: id_,
                     USAGE_METADATA: {
-                        INPUT_TOKENS: usage_metadata.get(
-                            INPUT_TOKENS, 0
-                        ),
-                        OUTPUT_TOKENS: usage_metadata.get(
-                            OUTPUT_TOKENS, 0
-                        ),
-                        TOTAL_TOKENS: usage_metadata.get(
-                            TOTAL_TOKENS, 0
-                        ),
+                        INPUT_TOKENS: usage_metadata.get(INPUT_TOKENS, 0),
+                        OUTPUT_TOKENS: usage_metadata.get(OUTPUT_TOKENS, 0),
+                        TOTAL_TOKENS: usage_metadata.get(TOTAL_TOKENS, 0),
                     },
                 }
-            else:
-                content = llmresult.content
-                response_metadata = llmresult.response_metadata
-                id_ = llmresult.id
-                token_usage = response_metadata[TOKEN_USAGE]
-
+            elif TOKEN_USAGE in response_metadata: # Fallback for models that put token_usage in response_metadata
+                 token_usage = response_metadata[TOKEN_USAGE]
+                 parsed_result = {
+                    CONTENT: content,
+                    RESPONSE_METADATA: {
+                        MODEL_NAME: response_metadata.get(MODEL, response_metadata.get(MODEL_NAME, "")), # try MODEL then MODEL_NAME
+                        FINISH_REASON: response_metadata.get(FINISH_REASON, ""),
+                    },
+                    ID: id_,
+                    USAGE_METADATA: { # Construct from token_usage
+                        INPUT_TOKENS: token_usage.get("prompt_tokens", 0) if isinstance(token_usage, dict) else getattr(token_usage, "prompt_tokens", 0),
+                        OUTPUT_TOKENS: token_usage.get("completion_tokens", 0) if isinstance(token_usage, dict) else getattr(token_usage, "completion_tokens", 0),
+                        TOTAL_TOKENS: token_usage.get("total_tokens", 0) if isinstance(token_usage, dict) else getattr(token_usage, "total_tokens", 0),
+                    },
+                }
+            else: # For MistralModel or others where usage_metadata is not directly available
+                  # We might not have token usage details from Mistral's basic chat completion directly
+                  # Logging will have to rely on what's available or skip token counts if not present
                 parsed_result = {
                     CONTENT: content,
                     RESPONSE_METADATA: {
-                        MODEL_NAME: response_metadata.get(
-                            MODEL, ""
-                        ),
-                        FINISH_REASON: response_metadata.get(
-                            FINISH_REASON, ""
-                        ),
+                        MODEL_NAME: response_metadata.get(MODEL_NAME, self.llm.llm_model if hasattr(self.llm, 'llm_model') else ""), # Use llm_model if available
+                        FINISH_REASON: response_metadata.get(FINISH_REASON, ""),
+                        # Add other relevant metadata if available
                     },
                     ID: id_,
+                    # USAGE_METADATA might be absent or minimal for Mistral if not provided by the client
                     USAGE_METADATA: {
-                        INPUT_TOKENS: token_usage.prompt_tokens,
-                        OUTPUT_TOKENS: token_usage.completion_tokens,
-                        TOTAL_TOKENS: token_usage.total_tokens,
+                        INPUT_TOKENS: 0, # Placeholder if not available
+                        OUTPUT_TOKENS: 0, # Placeholder if not available
+                        TOTAL_TOKENS: 0,  # Placeholder if not available
                     },
                 }
             logger.debug(f"Parsed LLM result successfully: {parsed_result}")
@@ -459,8 +501,8 @@ class LoggerChatModel:
 
 
 class GPTAnswerer:
-    def __init__(self, config, llm_api_key):
-        self.ai_adapter = AIAdapter(config, llm_api_key)
+    def __init__(self, config): # llm_api_key removed
+        self.ai_adapter = AIAdapter(config) # llm_api_key removed
         self.llm_cheap = LoggerChatModel(self.ai_adapter)
 
     @property
